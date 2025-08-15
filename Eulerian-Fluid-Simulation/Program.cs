@@ -5,9 +5,9 @@ using System.Numerics;
 public class Program
 {
     // Grid dimensions
-    const int GRID_WIDTH = 100;
-    const int GRID_HEIGHT = 100;
-    const float CELL_SIZE = 8.0f; // Pixels per cell (rendering only)
+    const int GRID_WIDTH = 128;
+    const int GRID_HEIGHT = 128;
+    const float CELL_SIZE = 6.0f; // Pixels per cell (rendering only)
 
     // Simulation step (seconds). We'll keep it fixed for now; later we can compute CFL.
     const float DT = 0.1f;
@@ -30,9 +30,9 @@ public class Program
     // ===== Physics parameters (tweakable) =====
     const float RHO = 1.0f;              // fluid density
     const float GRAVITY_X = 0.0f;        // body force x
-    const float GRAVITY_Y = -3.0f;       // body force y (down)
+    const float GRAVITY_Y = -9.0f;       // body force y (down)
     const float VISCOSITY = 0.0005f;     // kinematic viscosity (set 0 to disable)
-    const int DIFFUSION_ITERS = 30;    // Jacobi iterations for diffusion
+    const int DIFFUSION_ITERS = 10;    // Jacobi iterations for diffusion
     const int PRESSURE_ITERS = 200;   // Jacobi iterations for Poisson
 
     // Poisson / divergence buffers (cell-centered)
@@ -70,16 +70,28 @@ public class Program
     {
         float dt = DT; // fixed for now
 
-        // Density injection with left mouse button
+        // Paint density in a small radius around mouse
         if (Raylib.IsMouseButtonDown(MouseButton.Left))
         {
             Vector2 mouse = Raylib.GetMousePosition();
             int gx = (int)(mouse.X / CELL_SIZE);
             int gy = (int)(mouse.Y / CELL_SIZE);
 
-            if (gx >= 0 && gx < GRID_WIDTH && gy >= 0 && gy < GRID_HEIGHT)
+            int radius = 6; // in grid cells
+
+            for (int y = gy - radius; y <= gy + radius; y++)
             {
-                density[gx, gy] = MathF.Min(1.0f, density[gx, gy] + 0.2f);
+                for (int x = gx - radius; x <= gx + radius; x++)
+                {
+                    if (x >= 0 && x < GRID_WIDTH && y >= 0 && y < GRID_HEIGHT)
+                    {
+                        float distSq = (x - gx) * (x - gx) + (y - gy) * (y - gy);
+                        if (distSq <= radius * radius)
+                        {
+                            density[x, y] = Math.Min(1.0f, density[x, y] + 1f);
+                        }
+                    }
+                }
             }
         }
 
@@ -429,10 +441,20 @@ public class Program
         float xu = gridPos.X;
         float yu = gridPos.Y - 0.5f;
         AddBilinear(u, xu, yu, impulse.X);
+        AddBilinear(u, xu - 1, yu, impulse.X);
+        AddBilinear(u, xu + 1, yu, impulse.X);
+        AddBilinear(u, xu, yu + 1, impulse.X);
+        AddBilinear(u, xu, yu - 1, impulse.X);
+
+
 
         float xv = gridPos.X - 0.5f;
         float yv = gridPos.Y;
         AddBilinear(v, xv, yv, impulse.Y);
+        AddBilinear(v, xv, yv - 1, impulse.Y);
+        AddBilinear(v, xv, yv + 1, impulse.Y);
+        AddBilinear(v, xv + 1, yv, impulse.Y);
+        AddBilinear(v, xv - 1, yv, impulse.Y);
     }
 
     static void AddBilinear(float[,] A, float x, float y, float value)
@@ -487,7 +509,7 @@ public class Program
         }
 
         // Optional: overlay velocity vectors (press V to toggle later if desired)
-        DrawVelocityField(12);
+        DrawVelocityField(6);
 
         Raylib.EndDrawing();
     }
