@@ -5,8 +5,8 @@ using System.Numerics;
 public class Program
 {
     // Grid dimensions
-    const int GRID_WIDTH = 64;
-    const int GRID_HEIGHT = 64;
+    const int GRID_WIDTH = 100;
+    const int GRID_HEIGHT = 100;
     const float CELL_SIZE = 8.0f; // Pixels per cell (rendering only)
 
     // Simulation step (seconds). We'll keep it fixed for now; later we can compute CFL.
@@ -27,16 +27,33 @@ public class Program
     static float[,] uTmp = new float[GRID_WIDTH + 1, GRID_HEIGHT];
     static float[,] vTmp = new float[GRID_WIDTH, GRID_HEIGHT + 1];
 
+    // ===== Physics parameters (tweakable) =====
+    const float RHO = 1.0f;              // fluid density
+    const float GRAVITY_X = 0.0f;        // body force x
+    const float GRAVITY_Y = -3.0f;       // body force y (down)
+    const float VISCOSITY = 0.0005f;     // kinematic viscosity (set 0 to disable)
+    const int DIFFUSION_ITERS = 30;    // Jacobi iterations for diffusion
+    const int PRESSURE_ITERS = 200;   // Jacobi iterations for Poisson
+
+    // Poisson / divergence buffers (cell-centered)
+    static float[,] pressureTmp = new float[GRID_WIDTH, GRID_HEIGHT];
+    static float[,] rhs = new float[GRID_WIDTH, GRID_HEIGHT];
+    static float[,] divergence = new float[GRID_WIDTH, GRID_HEIGHT];
+
+    // Diffusion RHS copies (staggered)
+    static float[,] u0 = new float[GRID_WIDTH + 1, GRID_HEIGHT];
+    static float[,] v0 = new float[GRID_WIDTH, GRID_HEIGHT + 1];
+
     // Mouse state for simple velocity injection
     static Vector2 prevMouse;
-    const float MOUSE_FORCE_SCALE = 6.0f; // tweakable impulse strength
+    const float MOUSE_FORCE_SCALE = 15.0f; // tweakable impulse strength
 
     public static void Main()
     {
         int screenWidth = (int)(GRID_WIDTH * CELL_SIZE);
         int screenHeight = (int)(GRID_HEIGHT * CELL_SIZE);
 
-        Raylib.InitWindow(screenWidth, screenHeight, "2D Eulerian Fluid Simulation - MAC Grid (Advection)");
+        Raylib.InitWindow(screenWidth, screenHeight, "2D Eulerian Fluid Simulation - MAC Grid (Advection+Projection)");
         Raylib.SetTargetFPS(120);
         prevMouse = Raylib.GetMousePosition();
 
@@ -76,11 +93,32 @@ public class Program
         }
         prevMouse = mouseNow;
 
-        // --- Advection step ---
+        // --- Core fluid step order ---
+        // 1) Advect scalars and velocity by current velocity
         AdvectDensity(dt);
         AdvectVelocity(dt);
 
-        // (No forces, diffusion, or projection yet.)
+        // 2) Apply body forces (e.g., gravity)
+        ApplyForces(dt);
+
+        // 3) Implicit diffusion (viscosity)
+        if (VISCOSITY > 0.0f)
+            DiffuseVelocities(dt);
+
+        // 4) Enforce simple box boundary before projection
+        EnforceBoundaries();
+
+        // 5) Build divergence and RHS for pressure Poisson
+        ComputeDivergenceAndRHS(dt);
+
+        // 6) Solve for pressure (Jacobi)
+        SolvePressureJacobi(PRESSURE_ITERS);
+
+        // 7) Subtract pressure gradient (projection)
+        ProjectVelocities(dt);
+
+        // 8) Final boundary clamp
+        EnforceBoundaries();
     }
 
     // ===================== Advection (Semi-Lagrangian, RK2) =====================
@@ -145,7 +183,6 @@ public class Program
 
     static Vector2 SampleVelocity(Vector2 pos)
     {
-        // Reconstruct continuous velocity from staggered components
         float ux = SampleU(u, pos);
         float vy = SampleV(v, pos);
         return new Vector2(ux, vy);
@@ -153,8 +190,7 @@ public class Program
 
     static float SampleScalar(float[,] A, Vector2 pos)
     {
-        // Scalars live at cell centers (i+0.5, j+0.5)
-        float xs = pos.X - 0.5f; // convert to index space
+        float xs = pos.X - 0.5f; // cell-centered index space
         float ys = pos.Y - 0.5f;
         return Bilinear(A, xs, ys, GRID_WIDTH, GRID_HEIGHT);
     }
@@ -177,7 +213,6 @@ public class Program
 
     static float Bilinear(float[,] A, float x, float y, int NX, int NY)
     {
-        // Clamp to valid interpolation domain so i1/j1 exist
         const float EPS = 1e-4f;
         float xc = MathF.Max(0.0f, MathF.Min(x, NX - 1 - EPS));
         float yc = MathF.Max(0.0f, MathF.Min(y, NY - 1 - EPS));
@@ -190,7 +225,6 @@ public class Program
         float sx = xc - i0;
         float sy = yc - j0;
 
-        // Guard edges (when NX==1 or NY==1) — keep inside bounds
         if (i1 >= NX) i1 = NX - 1;
         if (j1 >= NY) j1 = NY - 1;
 
@@ -208,7 +242,6 @@ public class Program
 
     static Vector2 ClampToScalarDomain(Vector2 p)
     {
-        // Scalars live at centers in [0.5, Nx-0.5] × [0.5, Ny-0.5]
         float x = MathF.Max(0.5f, MathF.Min(p.X, GRID_WIDTH - 0.5f));
         float y = MathF.Max(0.5f, MathF.Min(p.Y, GRID_HEIGHT - 0.5f));
         return new Vector2(x, y);
@@ -216,7 +249,6 @@ public class Program
 
     static Vector2 ClampToUDomain(Vector2 p)
     {
-        // U faces live at x∈[0..Nx], y∈[0.5..Ny-0.5]
         float x = MathF.Max(0.0f, MathF.Min(p.X, GRID_WIDTH));
         float y = MathF.Max(0.5f, MathF.Min(p.Y, GRID_HEIGHT - 0.5f));
         return new Vector2(x, y);
@@ -224,7 +256,6 @@ public class Program
 
     static Vector2 ClampToVDomain(Vector2 p)
     {
-        // V faces live at x∈[0.5..Nx-0.5], y∈[0..Ny]
         float x = MathF.Max(0.5f, MathF.Min(p.X, GRID_WIDTH - 0.5f));
         float y = MathF.Max(0.0f, MathF.Min(p.Y, GRID_HEIGHT));
         return new Vector2(x, y);
@@ -235,20 +266,170 @@ public class Program
         var tmp = A; A = B; B = tmp;
     }
 
+    // ===================== Forces, diffusion, projection =====================
+
+    static void ApplyForces(float dt)
+    {
+        // Add uniform body force to velocities
+        for (int j = 0; j < GRID_HEIGHT; j++)
+        {
+            for (int i = 0; i <= GRID_WIDTH; i++)
+                u[i, j] += dt * GRAVITY_X;
+        }
+        for (int j = 0; j <= GRID_HEIGHT; j++)
+        {
+            for (int i = 0; i < GRID_WIDTH; i++)
+                v[i, j] += dt * GRAVITY_Y;
+        }
+    }
+
+    static void EnforceBoundaries()
+    {
+        // No-flow box: zero normal velocity at domain edges
+        for (int j = 0; j < GRID_HEIGHT; j++)
+        {
+            u[0, j] = 0.0f;
+            u[GRID_WIDTH, j] = 0.0f;
+        }
+        for (int i = 0; i < GRID_WIDTH; i++)
+        {
+            v[i, 0] = 0.0f;
+            v[i, GRID_HEIGHT] = 0.0f;
+        }
+    }
+
+    static void DiffuseVelocities(float dt)
+    {
+        float alpha = VISCOSITY * dt; // ν dt
+        if (alpha <= 0.0f) return;
+
+        // Copy RHS sources (original fields remain constant in the implicit solve)
+        CopyArray(u, u0);
+        CopyArray(v, v0);
+
+        // Jacobi iterations for both components on their staggered grids
+        for (int iter = 0; iter < DIFFUSION_ITERS; iter++)
+        {
+            // --- Jacobi for u (size: Nx+1 by Ny) ---
+            for (int j = 0; j < GRID_HEIGHT; j++)
+            {
+                for (int i = 0; i <= GRID_WIDTH; i++)
+                {
+                    float sumN = 0.0f; int N = 0;
+                    if (i > 0) { sumN += u[i - 1, j]; N++; }
+                    if (i < GRID_WIDTH) { sumN += u[i + 1, j]; N++; }
+                    if (j > 0) { sumN += u[i, j - 1]; N++; }
+                    if (j < GRID_HEIGHT - 1) { sumN += u[i, j + 1]; N++; }
+
+                    float denom = 1.0f + alpha * N;
+                    uTmp[i, j] = (u0[i, j] + alpha * sumN) / denom;
+                }
+            }
+            Swap(ref u, ref uTmp);
+
+            // --- Jacobi for v (size: Nx by Ny+1) ---
+            for (int j = 0; j <= GRID_HEIGHT; j++)
+            {
+                for (int i = 0; i < GRID_WIDTH; i++)
+                {
+                    float sumN = 0.0f; int N = 0;
+                    if (i > 0) { sumN += v[i - 1, j]; N++; }
+                    if (i < GRID_WIDTH - 1) { sumN += v[i + 1, j]; N++; }
+                    if (j > 0) { sumN += v[i, j - 1]; N++; }
+                    if (j < GRID_HEIGHT) { sumN += v[i, j + 1]; N++; }
+
+                    float denom = 1.0f + alpha * N;
+                    vTmp[i, j] = (v0[i, j] + alpha * sumN) / denom;
+                }
+            }
+            Swap(ref v, ref vTmp);
+
+            EnforceBoundaries();
+        }
+    }
+
+    static void ComputeDivergenceAndRHS(float dt)
+    {
+        float scale = RHO / dt; // (rho/dt) * div
+        for (int j = 0; j < GRID_HEIGHT; j++)
+        {
+            for (int i = 0; i < GRID_WIDTH; i++)
+            {
+                float dudx = u[i + 1, j] - u[i, j];
+                float dvdy = v[i, j + 1] - v[i, j];
+                float div = dudx + dvdy; // grid spacing h = 1
+                divergence[i, j] = div;
+                rhs[i, j] = scale * div;
+            }
+        }
+    }
+
+    static void SolvePressureJacobi(int iterations)
+    {
+        // Start from previous pressure; Jacobi will relax toward the solution.
+        for (int k = 0; k < iterations; k++)
+        {
+            for (int j = 0; j < GRID_HEIGHT; j++)
+            {
+                for (int i = 0; i < GRID_WIDTH; i++)
+                {
+                    float sumN = 0.0f; int N = 0;
+                    if (i > 0) { sumN += pressure[i - 1, j]; N++; }
+                    if (i < GRID_WIDTH - 1) { sumN += pressure[i + 1, j]; N++; }
+                    if (j > 0) { sumN += pressure[i, j - 1]; N++; }
+                    if (j < GRID_HEIGHT - 1) { sumN += pressure[i, j + 1]; N++; }
+
+                    pressureTmp[i, j] = (N > 0) ? (sumN - rhs[i, j]) / N : 0.0f; // h=1
+                }
+            }
+            Swap(ref pressure, ref pressureTmp);
+        }
+    }
+
+    static void ProjectVelocities(float dt)
+    {
+        float scale = dt / RHO; // (dt/rho) * grad p
+
+        // u faces: i in [1..Nx-1], j in [0..Ny-1]
+        for (int j = 0; j < GRID_HEIGHT; j++)
+        {
+            for (int i = 1; i < GRID_WIDTH; i++)
+            {
+                float gradp = pressure[i, j] - pressure[i - 1, j];
+                u[i, j] -= scale * gradp;
+            }
+        }
+
+        // v faces: i in [0..Nx-1], j in [1..Ny-1]
+        for (int j = 1; j < GRID_HEIGHT; j++)
+        {
+            for (int i = 0; i < GRID_WIDTH; i++)
+            {
+                float gradp = pressure[i, j] - pressure[i, j - 1];
+                v[i, j] -= scale * gradp;
+            }
+        }
+    }
+
+    // ===================== Helpers =====================
+
+    static void CopyArray(float[,] src, float[,] dst)
+    {
+        int NX = src.GetLength(0), NY = src.GetLength(1);
+        for (int j = 0; j < NY; j++)
+            for (int i = 0; i < NX; i++)
+                dst[i, j] = src[i, j];
+    }
+
     // ===================== Optional: simple velocity injection near cursor =====================
 
     static void InjectVelocity(Vector2 gridPos, Vector2 impulse)
     {
         // Add to nearby u and v faces with bilinear weights around the cursor cell
-        // This is purely for interactive testing to see density move.
-
-        // Affect u faces around (i0..i0+1, j0..j0+1) in u-index space
-        // Map gridPos to u index space: (x_u = x, y_u = y-0.5)
         float xu = gridPos.X;
         float yu = gridPos.Y - 0.5f;
         AddBilinear(u, xu, yu, impulse.X);
 
-        // Affect v faces around (i0..i0+1, j0..j0+1) in v-index space
         float xv = gridPos.X - 0.5f;
         float yv = gridPos.Y;
         AddBilinear(v, xv, yv, impulse.Y);
@@ -306,10 +487,9 @@ public class Program
         }
 
         // Optional: overlay velocity vectors (press V to toggle later if desired)
-        DrawVelocityField(1);
+        DrawVelocityField(12);
 
         Raylib.EndDrawing();
-        
     }
 
     static void DrawVelocityField(int stride)
@@ -321,8 +501,8 @@ public class Program
             {
                 Vector2 pos = new Vector2((i + 0.5f) * CELL_SIZE, (j + 0.5f) * CELL_SIZE);
                 Vector2 vel = SampleVelocity(new Vector2(i + 0.5f, j + 0.5f));
-                Vector2 tip = pos + vel * CELL_SIZE * 1f; // scale for display
-                Raylib.DrawLine((int)pos.X, (int)pos.Y, (int)tip.X, (int)tip.Y, Color.Green);
+                Vector2 tip = pos + vel * CELL_SIZE * 0.2f; // scale for display
+                Raylib.DrawLine((int)pos.X, (int)pos.Y, (int)tip.X, (int)tip.Y, Color.DarkGreen);
             }
         }
     }
