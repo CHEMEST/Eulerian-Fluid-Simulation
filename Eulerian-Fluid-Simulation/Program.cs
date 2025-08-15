@@ -306,9 +306,10 @@ public class Program
         }
 
         // Optional: overlay velocity vectors (press V to toggle later if desired)
-        DrawVelocityField(12);
+        DrawVelocityField(1);
 
         Raylib.EndDrawing();
+        
     }
 
     static void DrawVelocityField(int stride)
@@ -320,8 +321,8 @@ public class Program
             {
                 Vector2 pos = new Vector2((i + 0.5f) * CELL_SIZE, (j + 0.5f) * CELL_SIZE);
                 Vector2 vel = SampleVelocity(new Vector2(i + 0.5f, j + 0.5f));
-                Vector2 tip = pos + vel * CELL_SIZE * 0.2f; // scale for display
-                Raylib.DrawLine((int)pos.X, (int)pos.Y, (int)tip.X, (int)tip.Y, Color.DarkGreen);
+                Vector2 tip = pos + vel * CELL_SIZE * 1f; // scale for display
+                Raylib.DrawLine((int)pos.X, (int)pos.Y, (int)tip.X, (int)tip.Y, Color.Green);
             }
         }
     }
