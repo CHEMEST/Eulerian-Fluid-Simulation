@@ -1,6 +1,7 @@
 ﻿using Raylib_cs;
 using System;
 using System.Numerics;
+using System.Diagnostics;
 
 public class Program
 {
@@ -32,13 +33,14 @@ public class Program
     const float GRAVITY_X = 0.0f;        // body force x
     const float GRAVITY_Y = -9.0f;       // body force y (down)
     const float VISCOSITY = 0.0005f;     // kinematic viscosity (set 0 to disable)
-    const int DIFFUSION_ITERS = 10;    // Jacobi iterations for diffusion
-    const int PRESSURE_ITERS = 200;   // Jacobi iterations for Poisson
+    const int DIFFUSION_ITERS = 10;      // Jacobi iterations for diffusion
+    const int PRESSURE_ITERS = 200;      // Jacobi iterations for Poisson
 
     // Poisson / divergence buffers (cell-centered)
     static float[,] pressureTmp = new float[GRID_WIDTH, GRID_HEIGHT];
     static float[,] rhs = new float[GRID_WIDTH, GRID_HEIGHT];
     static float[,] divergence = new float[GRID_WIDTH, GRID_HEIGHT];
+    static float[,] divergencePost = new float[GRID_WIDTH, GRID_HEIGHT];
 
     // Diffusion RHS copies (staggered)
     static float[,] u0 = new float[GRID_WIDTH + 1, GRID_HEIGHT];
@@ -48,18 +50,36 @@ public class Program
     static Vector2 prevMouse;
     const float MOUSE_FORCE_SCALE = 15.0f; // tweakable impulse strength
 
+    // Diagnostics
+    static Diagnostics diag = new Diagnostics();
+
+    // Control
+    static bool paused = false;
+    static bool singleStep = false;
+
     public static void Main()
     {
         int screenWidth = (int)(GRID_WIDTH * CELL_SIZE);
         int screenHeight = (int)(GRID_HEIGHT * CELL_SIZE);
 
-        Raylib.InitWindow(screenWidth, screenHeight, "2D Eulerian Fluid Simulation - MAC Grid (Advection+Projection)");
+        Raylib.InitWindow(screenWidth, screenHeight, "2D Eulerian Fluid Simulation - MAC Grid (Advection+Projection+Diagnostics)");
         Raylib.SetTargetFPS(120);
         prevMouse = Raylib.GetMousePosition();
 
         while (!Raylib.WindowShouldClose())
         {
-            Update();
+            // Controls
+            if (Raylib.IsKeyPressed(KeyboardKey.D)) diag.toggleShow();
+            if (Raylib.IsKeyPressed(KeyboardKey.P)) paused = !paused;
+            if (Raylib.IsKeyPressed(KeyboardKey.N)) singleStep = true;
+            if (Raylib.IsKeyPressed(KeyboardKey.C)) diag.ClearHistory(); // clear time-series
+
+            if (!paused || singleStep)
+            {
+                Update();
+                singleStep = false;
+            }
+
             Draw();
         }
 
@@ -68,6 +88,8 @@ public class Program
 
     static void Update()
     {
+        var swFrame = Stopwatch.StartNew();
+
         float dt = DT; // fixed for now
 
         // Paint density in a small radius around mouse
@@ -85,10 +107,14 @@ public class Program
                 {
                     if (x >= 0 && x < GRID_WIDTH && y >= 0 && y < GRID_HEIGHT)
                     {
-                        float distSq = (x - gx) * (x - gx) + (y - gy) * (y - gy);
+                        int dx = x - gx;
+                        int dy = y - gy;
+                        float distSq = dx * dx + dy * dy;
                         if (distSq <= radius * radius)
                         {
-                            density[x, y] = Math.Min(1.0f, density[x, y] + 1f);
+                            // deposit proportional to distance (feels nicer)
+                            float falloff = 1.0f - MathF.Sqrt(distSq) / (radius + 1e-6f);
+                            density[x, y] = MathF.Min(1.0f, density[x, y] + 1.0f * falloff);
                         }
                     }
                 }
@@ -105,32 +131,77 @@ public class Program
         }
         prevMouse = mouseNow;
 
+        var swAdvection = Stopwatch.StartNew();
         // --- Core fluid step order ---
         // 1) Advect scalars and velocity by current velocity
         AdvectDensity(dt);
         AdvectVelocity(dt);
+        swAdvection.Stop();
 
+        var swForces = Stopwatch.StartNew();
         // 2) Apply body forces (e.g., gravity)
         ApplyForces(dt);
+        swForces.Stop();
 
+        var swDiffuse = Stopwatch.StartNew();
         // 3) Implicit diffusion (viscosity)
         if (VISCOSITY > 0.0f)
             DiffuseVelocities(dt);
+        swDiffuse.Stop();
 
+        var swBoundary1 = Stopwatch.StartNew();
         // 4) Enforce simple box boundary before projection
         EnforceBoundaries();
+        swBoundary1.Stop();
 
+        var swDivergence = Stopwatch.StartNew();
         // 5) Build divergence and RHS for pressure Poisson
         ComputeDivergenceAndRHS(dt);
+        swDivergence.Stop();
 
+        var swPressure = Stopwatch.StartNew();
         // 6) Solve for pressure (Jacobi)
-        SolvePressureJacobi(PRESSURE_ITERS);
+        float lastPressureResidual = SolvePressureJacobi(PRESSURE_ITERS);
+        swPressure.Stop();
 
+        var swProject = Stopwatch.StartNew();
         // 7) Subtract pressure gradient (projection)
         ProjectVelocities(dt);
+        swProject.Stop();
 
+        var swBoundary2 = Stopwatch.StartNew();
         // 8) Final boundary clamp
         EnforceBoundaries();
+        swBoundary2.Stop();
+
+        swFrame.Stop();
+
+        // compute post-projection divergence for diagnostics
+        ComputeDivergencePost();
+
+        // NaN / Inf check
+        bool hasNaN = ScanForNaNInf();
+        if (hasNaN)
+        {
+            paused = true;
+            Console.WriteLine("NaN/Inf detected — simulation paused. Check arrays.");
+        }
+
+        // Gather diagnostics (fills ring buffers etc.)
+        diag.GatherAll(
+            density, u, v,
+            divergence, divergencePost,
+            pressure, lastPressureResidual,
+            dt,
+            swAdvection.ElapsedMilliseconds,
+            swForces.ElapsedMilliseconds,
+            swDiffuse.ElapsedMilliseconds,
+            swDivergence.ElapsedMilliseconds,
+            swPressure.ElapsedMilliseconds,
+            swProject.ElapsedMilliseconds,
+            swBoundary1.ElapsedMilliseconds + swBoundary2.ElapsedMilliseconds,
+            swFrame.ElapsedMilliseconds
+        );
     }
 
     // ===================== Advection (Semi-Lagrangian, RK2) =====================
@@ -376,11 +447,13 @@ public class Program
         }
     }
 
-    static void SolvePressureJacobi(int iterations)
+    // Solve pressure with Jacobi. Return last residual (L2 norm) for diagnostics.
+    static float SolvePressureJacobi(int iterations)
     {
-        // Start from previous pressure; Jacobi will relax toward the solution.
+        float lastResidual = float.PositiveInfinity;
         for (int k = 0; k < iterations; k++)
         {
+            float resAcc = 0.0f;
             for (int j = 0; j < GRID_HEIGHT; j++)
             {
                 for (int i = 0; i < GRID_WIDTH; i++)
@@ -395,7 +468,30 @@ public class Program
                 }
             }
             Swap(ref pressure, ref pressureTmp);
+
+            // compute residual every 8 iterations to save cost
+            if ((k & 7) == 0 || k == iterations - 1)
+            {
+                resAcc = 0.0f;
+                for (int j = 0; j < GRID_HEIGHT; j++)
+                {
+                    for (int i = 0; i < GRID_WIDTH; i++)
+                    {
+                        float lap = 0.0f;
+                        int N = 0;
+                        if (i > 0) { lap += pressure[i - 1, j]; N++; }
+                        if (i < GRID_WIDTH - 1) { lap += pressure[i + 1, j]; N++; }
+                        if (j > 0) { lap += pressure[i, j - 1]; N++; }
+                        if (j < GRID_HEIGHT - 1) { lap += pressure[i, j + 1]; N++; }
+                        float Ap = (N > 0) ? (lap - N * pressure[i, j]) : 0.0f;
+                        float r = rhs[i, j] - Ap;
+                        resAcc += r * r;
+                    }
+                }
+                lastResidual = MathF.Sqrt(resAcc);
+            }
         }
+        return lastResidual;
     }
 
     static void ProjectVelocities(float dt)
@@ -423,6 +519,20 @@ public class Program
         }
     }
 
+    // compute divergence after projection into divergencePost
+    static void ComputeDivergencePost()
+    {
+        for (int j = 0; j < GRID_HEIGHT; j++)
+        {
+            for (int i = 0; i < GRID_WIDTH; i++)
+            {
+                float dudx = u[i + 1, j] - u[i, j];
+                float dvdy = v[i, j + 1] - v[i, j];
+                divergencePost[i, j] = dudx + dvdy;
+            }
+        }
+    }
+
     // ===================== Helpers =====================
 
     static void CopyArray(float[,] src, float[,] dst)
@@ -445,8 +555,6 @@ public class Program
         AddBilinear(u, xu + 1, yu, impulse.X);
         AddBilinear(u, xu, yu + 1, impulse.X);
         AddBilinear(u, xu, yu - 1, impulse.X);
-
-
 
         float xv = gridPos.X - 0.5f;
         float yv = gridPos.Y;
@@ -485,6 +593,26 @@ public class Program
         A[i1, j1] += value * w11;
     }
 
+    // scan arrays for NaN/Inf
+    static bool ScanForNaNInf()
+    {
+        for (int j = 0; j < GRID_HEIGHT; j++)
+            for (int i = 0; i < GRID_WIDTH; i++)
+                if (float.IsNaN(pressure[i, j]) || float.IsInfinity(pressure[i, j]) ||
+                    float.IsNaN(density[i, j]) || float.IsInfinity(density[i, j]))
+                    return true;
+
+        for (int j = 0; j < GRID_HEIGHT; j++)
+            for (int i = 0; i <= GRID_WIDTH; i++)
+                if (float.IsNaN(u[i, j]) || float.IsInfinity(u[i, j])) return true;
+
+        for (int j = 0; j <= GRID_HEIGHT; j++)
+            for (int i = 0; i < GRID_WIDTH; i++)
+                if (float.IsNaN(v[i, j]) || float.IsInfinity(v[i, j])) return true;
+
+        return false;
+    }
+
     // ===================== Rendering =====================
 
     static void Draw()
@@ -503,13 +631,19 @@ public class Program
                     (int)(y * CELL_SIZE),
                     (int)CELL_SIZE,
                     (int)CELL_SIZE,
-                    new Color(c, c, c, (byte) 255)
+                    new Color(c, c, c, (byte)255)
                 );
             }
         }
 
         // Optional: overlay velocity vectors (press V to toggle later if desired)
         DrawVelocityField(6);
+
+        // Diagnostics overlay
+        diag.DrawOverlay();
+
+        // small divergence preview (right side)
+        DrawDivergencePreview();
 
         Raylib.EndDrawing();
     }
@@ -525,6 +659,268 @@ public class Program
                 Vector2 vel = SampleVelocity(new Vector2(i + 0.5f, j + 0.5f));
                 Vector2 tip = pos + vel * CELL_SIZE * 0.2f; // scale for display
                 Raylib.DrawLine((int)pos.X, (int)pos.Y, (int)tip.X, (int)tip.Y, Color.DarkGreen);
+            }
+        }
+    }
+
+    static void DrawDivergencePreview()
+    {
+        int previewSize = 128;
+        int px = (int)(GRID_WIDTH * CELL_SIZE) - previewSize - 10;
+        int py = 10;
+        int cell = Math.Max(1, previewSize / GRID_WIDTH);
+
+        // Draw small background
+        Raylib.DrawRectangle(px - 2, py - 2, previewSize + 4, previewSize + 4, Color.DarkGray);
+
+        // Draw divergencePost scaled into preview area (simple downsample)
+        for (int pyi = 0; pyi < previewSize; pyi += cell)
+        {
+            for (int pxi = 0; pxi < previewSize; pxi += cell)
+            {
+                // map preview pixel to grid cell
+                int gi = (int)((float)pxi / previewSize * GRID_WIDTH);
+                int gj = (int)((float)pyi / previewSize * GRID_HEIGHT);
+                if (gi < 0) gi = 0; if (gi >= GRID_WIDTH) gi = GRID_WIDTH - 1;
+                if (gj < 0) gj = 0; if (gj >= GRID_HEIGHT) gj = GRID_HEIGHT - 1;
+                float d = divergencePost[gi, gj];
+                // color ramp: negative blue, zero black, positive red
+                float s = MathF.Tanh(MathF.Abs(d) * 10.0f); // clamp & scale
+                Color col = d > 0 ? ColorLerp(Color.Black, Color.Red, s) : ColorLerp(Color.Black, Color.SkyBlue, s);
+                Raylib.DrawRectangle(px + pxi, py + pyi, cell, cell, col);
+            }
+        }
+    }
+
+    static Color ColorLerp(Color a, Color b, float t)
+    {
+        t = MathF.Max(0, MathF.Min(1, t));
+        return new Color(
+            (byte)(a.R + (b.R - a.R) * t),
+            (byte)(a.G + (b.G - a.G) * t),
+            (byte)(a.B + (b.B - a.B) * t),
+            (byte) 255
+        );
+    }
+
+    // ===================== Diagnostics class =====================
+
+    class Diagnostics
+    {
+        // ring buffer length
+        const int LEN = 300;
+        int idx = 0;
+        int filled = 0;
+
+        // time series
+        float[] massHist = new float[LEN];
+        float[] tvHist = new float[LEN];
+        float[] keHist = new float[LEN];
+        float[] divPreMaxHist = new float[LEN];
+        float[] divPostMaxHist = new float[LEN];
+        float[] presResHist = new float[LEN];
+        float[] cflHist = new float[LEN];
+        float[] fpsHist = new float[LEN];
+
+        // last frame quick stats
+        public float lastMass = 0;
+        public float lastTV = 0;
+        public float lastKE = 0;
+        public float lastMaxSpeed = 0;
+        public float lastDivPreMax = 0;
+        public float lastDivPostMax = 0;
+        public float lastPressureResidual = 0;
+        public float lastCFL = 0;
+        public int frames = 0;
+
+        // display control
+        bool show = true;
+
+        // font/placement
+        int left = 8;
+        int top = 8;
+
+        public void toggleShow() { show = !show; }
+
+        public void ClearHistory()
+        {
+            idx = 0; filled = 0;
+            Array.Clear(massHist, 0, LEN);
+            Array.Clear(tvHist, 0, LEN);
+            Array.Clear(keHist, 0, LEN);
+            Array.Clear(divPreMaxHist, 0, LEN);
+            Array.Clear(divPostMaxHist, 0, LEN);
+            Array.Clear(presResHist, 0, LEN);
+            Array.Clear(cflHist, 0, LEN);
+            Array.Clear(fpsHist, 0, LEN);
+        }
+
+        public void GatherAll(
+            float[,] density,
+            float[,] u, float[,] v,
+            float[,] divPre, float[,] divPost,
+            float[,] pressure,
+            float pressureResidual,
+            float dt,
+            long msAdvection,
+            long msForces,
+            long msDiffuse,
+            long msDivergence,
+            long msPressure,
+            long msProject,
+            long msBoundaries,
+            long msFrame)
+        {
+            // mass & TV
+            float mass = 0f;
+            float tv = 0f;
+            for (int j = 0; j < GRID_HEIGHT; j++)
+            {
+                for (int i = 0; i < GRID_WIDTH; i++)
+                {
+                    float d = density[i, j];
+                    mass += d;
+                    if (i + 1 < GRID_WIDTH) tv += MathF.Abs(density[i + 1, j] - d);
+                    if (j + 1 < GRID_HEIGHT) tv += MathF.Abs(density[i, j + 1] - d);
+                }
+            }
+
+            // kinetic energy & max speed
+            float ke = 0f;
+            float maxSpeed = 0f;
+            for (int j = 0; j < GRID_HEIGHT; j++)
+            {
+                for (int i = 0; i <= GRID_WIDTH; i++)
+                {
+                    float val = u[i, j];
+                    ke += 0.5f * val * val;
+                    if (MathF.Abs(val) > maxSpeed) maxSpeed = MathF.Abs(val);
+                }
+            }
+            for (int j = 0; j <= GRID_HEIGHT; j++)
+            {
+                for (int i = 0; i < GRID_WIDTH; i++)
+                {
+                    float val = v[i, j];
+                    ke += 0.5f * val * val;
+                    if (MathF.Abs(val) > maxSpeed) maxSpeed = MathF.Abs(val);
+                }
+            }
+
+            // divergence norms
+            float divPreMax = 0f;
+            float divPreL2 = 0f;
+            float divPostMax = 0f;
+            float divPostL2 = 0f;
+            for (int j = 0; j < GRID_HEIGHT; j++)
+            {
+                for (int i = 0; i < GRID_WIDTH; i++)
+                {
+                    float a = divPre[i, j];
+                    float b = divPost[i, j];
+                    divPreMax = MathF.Max(divPreMax, MathF.Abs(a));
+                    divPostMax = MathF.Max(divPostMax, MathF.Abs(b));
+                    divPreL2 += a * a;
+                    divPostL2 += b * b;
+                }
+            }
+            divPreL2 = MathF.Sqrt(divPreL2);
+            divPostL2 = MathF.Sqrt(divPostL2);
+
+            // CFL
+            float cfl = maxSpeed * dt; // h = 1
+
+            // store
+            lastMass = mass;
+            lastTV = tv;
+            lastKE = ke;
+            lastMaxSpeed = maxSpeed;
+            lastDivPreMax = divPreMax;
+            lastDivPostMax = divPostMax;
+            lastPressureResidual = pressureResidual;
+            lastCFL = cfl;
+
+            massHist[idx] = mass;
+            tvHist[idx] = tv;
+            keHist[idx] = ke;
+            divPreMaxHist[idx] = divPreMax;
+            divPostMaxHist[idx] = divPostMax;
+            presResHist[idx] = pressureResidual;
+            cflHist[idx] = cfl;
+            fpsHist[idx] = Raylib.GetFPS();
+
+            idx = (idx + 1) % LEN;
+            filled = Math.Min(filled + 1, LEN);
+            frames++;
+        }
+
+        // Draw overlay UI (compact)
+        public void DrawOverlay()
+        {
+            if (!show) return;
+
+            int x = left;
+            int y = top;
+            int lineh = 16;
+
+            // background rectangle
+            Raylib.DrawRectangle(x - 6, y - 6, 420, 220, new Color(0, 0, 0, 150));
+
+            // header
+            Raylib.DrawText("Diagnostics (D toggles) — P: pause, N: step, C: clear history", x, y, 12, Color.LightGray);
+            y += lineh;
+
+            Raylib.DrawText($"Frame: {frames}", x, y, 12, Color.LightGray);
+            y += lineh;
+
+            Raylib.DrawText($"Mass: {lastMass:F3}   TV: {lastTV:F3}   KE: {lastKE:F3}", x, y, 12, Color.LightGray);
+            y += lineh;
+
+            Raylib.DrawText($"MaxSpeed: {lastMaxSpeed:F3}   CFL:{lastCFL:F3}   PresRes:{lastPressureResidual:E3}", x, y, 12, Color.LightGray);
+            y += lineh;
+
+            Raylib.DrawText($"DivPreMax: {lastDivPreMax:E3}   DivPostMax: {lastDivPostMax:E3}", x, y, 12, Color.LightGray);
+            y += lineh;
+
+            // simple small sparklines (mass, KE, divPost)
+            DrawSparkline("mass", massHist, x, y, 200, 40, filled, idx); y += 44;
+            DrawSparkline("KE", keHist, x, y, 200, 40, filled, idx); y += 44;
+            DrawSparkline("divPostMax", divPostMaxHist, x, y, 200, 40, filled, idx); y += 44;
+        }
+
+        void DrawSparkline(string label, float[] buffer, int x, int y, int w, int h, int filled, int idx)
+        {
+            Raylib.DrawText(label, x, y, 10, Color.LightGray);
+            int bx = x + 60;
+            int by = y;
+            Raylib.DrawRectangle(bx - 2, by - 2, w + 4, h + 4, new Color(80, 80, 80, 120));
+            if (filled == 0) return;
+            // find range
+            float min = float.MaxValue, max = float.MinValue;
+            for (int i = 0; i < filled; i++)
+            {
+                float v = buffer[i];
+                if (float.IsNaN(v) || float.IsInfinity(v)) continue;
+                if (v < min) min = v;
+                if (v > max) max = v;
+            }
+            if (min == float.MaxValue) min = 0; // avoid
+            if (min == max) max = min + 1e-6f;
+            // draw polyline
+            int display = Math.Min(filled, w);
+            for (int i = 0; i < display - 1; i++)
+            {
+                int a = (idx - i - 1 + LEN) % LEN;
+                int b = (idx - i - 2 + LEN) % LEN;
+                float va = buffer[a];
+                float vb = buffer[b];
+                float na = (va - min) / (max - min);
+                float nb = (vb - min) / (max - min);
+                int xa = bx + (display - 1 - i);
+                int xb = bx + (display - 2 - i);
+                int ya = by + h - (int)(na * h);
+                int yb = by + h - (int)(nb * h);
+                Raylib.DrawLine(xa, ya, xb, yb, Color.Green);
             }
         }
     }
