@@ -6,10 +6,10 @@ using System.Diagnostics;
 public class Program
 {
     // ---------------- Grid & render ----------------
-    const int NX = 256;
-    const int NY = 256;
-    const float CELL_SIZE = 2.0f; // pixels per cell
-    const float DT = 0.1f;
+    const int NX = 200;
+    const int NY = 200;
+    const float CELL_SIZE = 3.0f; // pixels per cell
+    const float DT = 0.2f;
 
     // ---------------- Physics params ----------------
     const float RHO = 1.0f;
@@ -18,7 +18,7 @@ public class Program
     const float VISCOSITY = 0.0005f;
     const int DIFFUSION_ITERS = 10;
 
-    // CG options (Stage 2)
+    // CG options (Stage 2)s
     const int CG_MAX_ITERS = 60;
     const float CG_REL_TOL = 1e-4f; // ||r||/||b||
 
