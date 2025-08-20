@@ -18,7 +18,7 @@ public class Program
     const float VISCOSITY = 0.0005f;
     const int DIFFUSION_ITERS = 10;
 
-    // CG options (Stage 2)s
+    // CG options (Stage 2)
     const int CG_MAX_ITERS = 60;
     const float CG_REL_TOL = 1e-4f; // ||r||/||b||
 
@@ -65,12 +65,24 @@ public class Program
     static int IU(int i, int j) => i + j * (NX + 1);            // u faces: 0..NX, 0..NY-1
     static int IV(int i, int j) => i + j * NX;                  // v faces: 0..NX-1, 0..NY
 
+    // ---------------- Solid (Level A) fields ----------------
+    static Vector2 circleCenter = new Vector2(NX * 0.5f, NY * 0.5f);
+    static float circleRadius = MathF.Min(NX, NY) * 0.12f; // default
+    static Vector2 circleVel = Vector2.Zero; // object velocity (static by default)
+    static byte[] solidCell = new byte[NX * NY];
+    static byte[] solidU = new byte[NU];
+    static byte[] solidV = new byte[NV];
+    static float[] phiCell = new float[NX * NY];
+    static float[] phiU = new float[NU];
+    static float[] phiV = new float[NV];
+    static int anchorIndex = 0;
+
     public static void Main()
     {
         int screenW = (int)(NX * CELL_SIZE);
         int screenH = (int)(NY * CELL_SIZE);
 
-        Raylib.InitWindow(screenW, screenH, "2D Eulerian Fluid (MAC) — flattened + CG + diagnostics");
+        Raylib.InitWindow(screenW, screenH, "2D Eulerian Fluid (MAC) — collisions (Level A) + CG + diagnostics");
         Raylib.SetTargetFPS(120);
         prevMouse = Raylib.GetMousePosition();
 
@@ -79,7 +91,7 @@ public class Program
         densityTex = Raylib.LoadTextureFromImage(img);
         Raylib.UnloadImage(img);
 
-        // Precompute CG diagonal inverse (1/N_center), anchor handled inside ApplyL
+        // initial precompute (will be updated per-frame)
         PrecomputeCGDiagonal();
 
         while (!Raylib.WindowShouldClose())
@@ -144,11 +156,30 @@ public class Program
         }
         prevMouse = mouseNow;
 
+        // --- Circle controls ---
+        // move circle with middle mouse
+        if (Raylib.IsMouseButtonDown(MouseButton.Middle))
+        {
+            Vector2 m = Raylib.GetMousePosition();
+            circleCenter = new Vector2(m.X / CELL_SIZE, m.Y / CELL_SIZE);
+        }
+        // radius adjust: Z decrease, X increase
+        if (Raylib.IsKeyDown(KeyboardKey.Z)) circleRadius = MathF.Max(1.0f, circleRadius - 0.2f);
+        if (Raylib.IsKeyDown(KeyboardKey.X)) circleRadius = MathF.Min(MathF.Min(NX, NY) * 0.45f, circleRadius + 0.2f);
+
+        // --- Build level set & masks for the circle (Level A) ---
+        BuildLevelSetCircle(circleCenter, circleRadius);
+        UpdateCGDiagonalFromMask();   // update diag for CG preconditioner based on masks
+        ApplySolidFaceBCs(circleVel); // enforce object face normal speeds before advection/diffusion
+
         // --- Advection ---
         var swAdv = Stopwatch.StartNew();
         AdvectDensity(dt);
         AdvectVelocity(dt);
         swAdv.Stop();
+
+        // After advection, remove any density inside the solid
+        ZeroDensityInSolidCells();
 
         // --- Forces ---
         var swForces = Stopwatch.StartNew();
@@ -163,11 +194,12 @@ public class Program
         // --- Boundaries pre-projection ---
         var swB1 = Stopwatch.StartNew();
         EnforceBoundaries();
+        ApplySolidFaceBCs(circleVel); // re-apply (defensive)
         swB1.Stop();
 
         // --- Divergence & RHS ---
         var swDiv = Stopwatch.StartNew();
-        ComputeDivergenceAndRHS(dt);
+        ComputeDivergenceAndRHS_WithSolid(dt);
         swDiv.Stop();
 
         // --- Pressure solve (Stage 2: CG) ---
@@ -177,12 +209,13 @@ public class Program
 
         // --- Projection ---
         var swProj = Stopwatch.StartNew();
-        ProjectVelocities(dt);
+        ProjectVelocities_WithSolid(dt);
         swProj.Stop();
 
         // --- Final boundaries ---
         var swB2 = Stopwatch.StartNew();
         EnforceBoundaries();
+        ApplySolidFaceBCs(circleVel); // final safeguard
         swB2.Stop();
 
         swFrame.Stop();
@@ -379,13 +412,42 @@ public class Program
             for (int j = 0; j < NY; j++)
                 for (int i = 0; i <= NX; i++)
                 {
+                    int id = IU(i, j);
+                    // if face is solid, keep fixed (Dirichlet)
+                    if (solidU[id] != 0) { uTmp[id] = u0[id]; continue; }
+
                     float sumN = 0f; int N = 0;
-                    if (i > 0) { sumN += u[IU(i - 1, j)]; N++; }
-                    if (i < NX) { sumN += u[IU(i + 1, j)]; N++; }
-                    if (j > 0) { sumN += u[IU(i, j - 1)]; N++; }
-                    if (j < NY - 1) { sumN += u[IU(i, j + 1)]; N++; }
-                    float denom = 1.0f + alpha * N;
-                    uTmp[IU(i, j)] = (u0[IU(i, j)] + alpha * sumN) / denom;
+                    // left
+                    if (i > 0)
+                    {
+                        int nid = IU(i - 1, j);
+                        sumN += u[nid];
+                        if (solidU[nid] == 0) N++;
+                    }
+                    // right
+                    if (i < NX)
+                    {
+                        int nid = IU(i + 1, j);
+                        sumN += u[nid];
+                        if (solidU[nid] == 0) N++;
+                    }
+                    // down
+                    if (j > 0)
+                    {
+                        int nid = IU(i, j - 1);
+                        sumN += u[nid];
+                        if (solidU[nid] == 0) N++;
+                    }
+                    // up
+                    if (j < NY - 1)
+                    {
+                        int nid = IU(i, j + 1);
+                        sumN += u[nid];
+                        if (solidU[nid] == 0) N++;
+                    }
+
+                    float denom = 1.0f + alpha * MathF.Max(1, N);
+                    uTmp[id] = (u0[id] + alpha * sumN) / denom;
                 }
             (u, uTmp) = (uTmp, u);
 
@@ -393,38 +455,79 @@ public class Program
             for (int j = 0; j <= NY; j++)
                 for (int i = 0; i < NX; i++)
                 {
+                    int id = IV(i, j);
+                    if (solidV[id] != 0) { vTmp[id] = v0[id]; continue; }
+
                     float sumN = 0f; int N = 0;
-                    if (i > 0) { sumN += v[IV(i - 1, j)]; N++; }
-                    if (i < NX - 1) { sumN += v[IV(i + 1, j)]; N++; }
-                    if (j > 0) { sumN += v[IV(i, j - 1)]; N++; }
-                    if (j < NY) { sumN += v[IV(i, j + 1)]; N++; }
-                    float denom = 1.0f + alpha * N;
-                    vTmp[IV(i, j)] = (v0[IV(i, j)] + alpha * sumN) / denom;
+                    // left
+                    if (i > 0)
+                    {
+                        int nid = IV(i - 1, j);
+                        sumN += v[nid];
+                        if (solidV[nid] == 0) N++;
+                    }
+                    // right
+                    if (i < NX - 1)
+                    {
+                        int nid = IV(i + 1, j);
+                        sumN += v[nid];
+                        if (solidV[nid] == 0) N++;
+                    }
+                    // down
+                    if (j > 0)
+                    {
+                        int nid = IV(i, j - 1);
+                        sumN += v[nid];
+                        if (solidV[nid] == 0) N++;
+                    }
+                    // up
+                    if (j < NY)
+                    {
+                        int nid = IV(i, j + 1);
+                        sumN += v[nid];
+                        if (solidV[nid] == 0) N++;
+                    }
+
+                    float denom = 1.0f + alpha * MathF.Max(1, N);
+                    vTmp[id] = (v0[id] + alpha * sumN) / denom;
                 }
             (v, vTmp) = (vTmp, v);
 
             EnforceBoundaries();
+            ApplySolidFaceBCs(circleVel);
         }
     }
 
+    // ============================================================
+    //                 DIVERGENCE & RHS (with solid)
+    // ============================================================
     static void ComputeDivergenceAndRHS(float dt)
+    {
+        // kept for compatibility (not used)
+        ComputeDivergenceAndRHS_WithSolid(dt);
+    }
+
+    static void ComputeDivergenceAndRHS_WithSolid(float dt)
     {
         float scale = RHO / dt;
         for (int j = 0; j < NY; j++)
             for (int i = 0; i < NX; i++)
             {
-                float dudx = u[IU(i + 1, j)] - u[IU(i, j)];
-                float dvdy = v[IV(i, j + 1)] - v[IV(i, j)];
-                float div = dudx + dvdy; // h = 1
+                float ue = (solidU[IU(i + 1, j)] == 0) ? u[IU(i + 1, j)] : circleVel.X;
+                float uw = (solidU[IU(i, j)] == 0) ? u[IU(i, j)] : circleVel.X;
+                float vn = (solidV[IV(i, j + 1)] == 0) ? v[IV(i, j + 1)] : circleVel.Y;
+                float vs = (solidV[IV(i, j)] == 0) ? v[IV(i, j)] : circleVel.Y;
+                float div = (ue - uw) + (vn - vs); // h = 1
                 divergence[Idx(i, j)] = div;
                 rhs[Idx(i, j)] = scale * div;
             }
+        // anchor rhs cleared later in solver
     }
 
-    // -------- Stage 2: Conjugate Gradient pressure solver --------
+    // -------- Stage 2: Conjugate Gradient pressure solver (with solid-aware ApplyL) --------
     static void PrecomputeCGDiagonal()
     {
-        // diag(L) = N_center (number of in-bounds neighbors). Anchor cell gets 1.
+        // basic (no-solid) diag; will be updated per-frame once masks exist
         for (int j = 0; j < NY; j++)
             for (int i = 0; i < NX; i++)
             {
@@ -435,13 +538,41 @@ public class Program
                 if (j < NY - 1) N++;
                 cg_diagInv[Idx(i, j)] = (N > 0) ? 1.0f / N : 1.0f;
             }
-        cg_diagInv[0] = 1.0f; // anchor
+        cg_diagInv[0] = 1.0f; // initial anchor
+    }
+
+    // Recompute diagonal inverse from current solid masks (call per-frame after BuildLevelSet)
+    static void UpdateCGDiagonalFromMask()
+    {
+        // find anchor = first fluid cell
+        anchorIndex = 0;
+        for (int k = 0; k < NX * NY; k++) { if (solidCell[k] == 0) { anchorIndex = k; break; } }
+
+        for (int j = 0; j < NY; j++)
+            for (int i = 0; i < NX; i++)
+            {
+                int id = Idx(i, j);
+                if (id == anchorIndex) { cg_diagInv[id] = 1.0f; continue; }
+
+                float sumA = 0f;
+                // east neighbor allowed if east face open
+                if (i < NX - 1 && solidU[IU(i + 1, j)] == 0) sumA += 1f;
+                // west neighbor
+                if (i > 0 && solidU[IU(i, j)] == 0) sumA += 1f;
+                // north neighbor
+                if (j < NY - 1 && solidV[IV(i, j + 1)] == 0) sumA += 1f;
+                // south neighbor
+                if (j > 0 && solidV[IV(i, j)] == 0) sumA += 1f;
+
+                if (sumA <= 0f) cg_diagInv[id] = 1.0f;
+                else cg_diagInv[id] = 1.0f / sumA;
+            }
     }
 
     static (int iters, float relRes) SolvePressureCG(int maxIters, float relTol)
     {
         // Anchor rhs at 0 — consistent with ApplyL
-        rhs[0] = 0.0f;
+        rhs[anchorIndex] = 0.0f;
 
         // r = b - A p
         ApplyL(pressure, cg_Ap);
@@ -450,7 +581,7 @@ public class Program
         {
             float r = rhs[k] - cg_Ap[k];
             cg_r[k] = r;
-            cg_z[k] = cg_diagInv[k] * r; // Jacobi preconditioner
+            cg_z[k] = cg_diagInv[k] * r; // Jacobi preconditioner (diagonal)
             cg_d[k] = cg_z[k];
             bnorm += rhs[k] * rhs[k];
         }
@@ -492,20 +623,26 @@ public class Program
         return (it, rel);
     }
 
-    // L p = sum(neighbors) - N_center * p, with an anchor at (0,0): L p = p
+    // L p = sum(open-neighbor p) - sum(open-neighbors) * p
+    // using anchorIndex to fix nullspace
     static void ApplyL(float[] x, float[] Lx)
     {
         for (int j = 0; j < NY; j++)
             for (int i = 0; i < NX; i++)
             {
                 int id = Idx(i, j);
-                if (id == 0) { Lx[id] = x[id]; continue; } // anchor
+                if (id == anchorIndex) { Lx[id] = x[id]; continue; }
 
                 float sum = 0f; int N = 0;
-                if (i > 0) { sum += x[Idx(i - 1, j)]; N++; }
-                if (i < NX - 1) { sum += x[Idx(i + 1, j)]; N++; }
-                if (j > 0) { sum += x[Idx(i, j - 1)]; N++; }
-                if (j < NY - 1) { sum += x[Idx(i, j + 1)]; N++; }
+                // west neighbor (face IU(i,j) between (i-1) and i)
+                if (i > 0 && solidU[IU(i, j)] == 0) { sum += x[Idx(i - 1, j)]; N++; }
+                // east neighbor
+                if (i < NX - 1 && solidU[IU(i + 1, j)] == 0) { sum += x[Idx(i + 1, j)]; N++; }
+                // south neighbor
+                if (j > 0 && solidV[IV(i, j)] == 0) { sum += x[Idx(i, j - 1)]; N++; }
+                // north neighbor
+                if (j < NY - 1 && solidV[IV(i, j + 1)] == 0) { sum += x[Idx(i, j + 1)]; N++; }
+
                 Lx[id] = sum - N * x[id];
             }
     }
@@ -524,22 +661,39 @@ public class Program
         for (int i = 0; i < n; i++) y[i] += alpha * x[i];
     }
 
-    static void ProjectVelocities(float dt)
+    // ============================================================
+    //                 PROJECTION (with solids)
+    // ============================================================
+    static void ProjectVelocities(float dt) => ProjectVelocities_WithSolid(dt);
+
+    static void ProjectVelocities_WithSolid(float dt)
     {
         float scale = dt / RHO;
-        // u faces: use pressure differences in x
+        // u faces: use pressure differences in x but only if face open
         for (int j = 0; j < NY; j++)
             for (int i = 1; i < NX; i++)
             {
+                int idu = IU(i, j);
+                if (solidU[idu] != 0)
+                {
+                    u[idu] = circleVel.X; // enforce solid face velocity
+                    continue;
+                }
                 float gradp = pressure[Idx(i, j)] - pressure[Idx(i - 1, j)];
-                u[IU(i, j)] -= scale * gradp;
+                u[idu] -= scale * gradp;
             }
         // v faces: use pressure differences in y
         for (int j = 1; j < NY; j++)
             for (int i = 0; i < NX; i++)
             {
+                int idv = IV(i, j);
+                if (solidV[idv] != 0)
+                {
+                    v[idv] = circleVel.Y;
+                    continue;
+                }
                 float gradp = pressure[Idx(i, j)] - pressure[Idx(i, j - 1)];
-                v[IV(i, j)] -= scale * gradp;
+                v[idv] -= scale * gradp;
             }
     }
 
@@ -605,6 +759,69 @@ public class Program
     }
 
     // ============================================================
+    //                          SOLID LEVELSET & MASKS (Level A)
+    // ============================================================
+    static void BuildLevelSetCircle(Vector2 C, float R)
+    {
+        float cx = C.X, cy = C.Y, r = R;
+        // cells
+        for (int j = 0; j < NY; j++)
+            for (int i = 0; i < NX; i++)
+            {
+                int id = Idx(i, j);
+                float px = i + 0.5f;
+                float py = j + 0.5f;
+                float d = MathF.Sqrt((px - cx) * (px - cx) + (py - cy) * (py - cy)) - r;
+                phiCell[id] = d;
+                solidCell[id] = (byte)(d < 0f ? 1 : 0);
+            }
+        // u faces (i, j+0.5)
+        for (int j = 0; j < NY; j++)
+            for (int i = 0; i <= NX; i++)
+            {
+                int id = IU(i, j);
+                float px = i;
+                float py = j + 0.5f;
+                float d = MathF.Sqrt((px - cx) * (px - cx) + (py - cy) * (py - cy)) - r;
+                phiU[id] = d;
+                solidU[id] = (byte)(d < 0f ? 1 : 0);
+            }
+        // v faces (i+0.5, j)
+        for (int j = 0; j <= NY; j++)
+            for (int i = 0; i < NX; i++)
+            {
+                int id = IV(i, j);
+                float px = i + 0.5f;
+                float py = j;
+                float d = MathF.Sqrt((px - cx) * (px - cx) + (py - cy) * (py - cy)) - r;
+                phiV[id] = d;
+                solidV[id] = (byte)(d < 0f ? 1 : 0);
+            }
+    }
+
+    static void ApplySolidFaceBCs(Vector2 Ub)
+    {
+        // set faces inside solid to object normal velocity (free-slip: set normal)
+        for (int j = 0; j < NY; j++)
+            for (int i = 0; i <= NX; i++)
+            {
+                int id = IU(i, j);
+                if (solidU[id] != 0) u[id] = Ub.X;
+            }
+        for (int j = 0; j <= NY; j++)
+            for (int i = 0; i < NX; i++)
+            {
+                int id = IV(i, j);
+                if (solidV[id] != 0) v[id] = Ub.Y;
+            }
+    }
+
+    static void ZeroDensityInSolidCells()
+    {
+        for (int k = 0; k < NX * NY; k++) if (solidCell[k] != 0) density[k] = 0f;
+    }
+
+    // ============================================================
     //                      SAFETY / DIAGNOSTICS
     // ============================================================
     static bool ScanForNaNInf()
@@ -638,6 +855,13 @@ public class Program
         Raylib.DrawTexturePro(densityTex, src, dst, new Vector2(0, 0), 0.0f, Color.White);
 
         if (showVel) DrawVelocityField(6);
+
+        // draw object (translucent fill + outline)
+        int cx = (int)(circleCenter.X * CELL_SIZE);
+        int cy = (int)(circleCenter.Y * CELL_SIZE);
+        float rpx = circleRadius * CELL_SIZE;
+        Raylib.DrawCircle(cx, cy, rpx, new Color(60, 140, 220, 40)); // translucent fill
+        Raylib.DrawCircleLines(cx, cy, rpx, Color.SkyBlue); // outline
 
         // Diagnostics overlay & mini divergence preview
         diag.DrawOverlay();
